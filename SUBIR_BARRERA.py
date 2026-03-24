@@ -1,0 +1,1037 @@
+"""
+SALIDA AUTOMATICA v2 (SIN DETENER)
+=================================
+Flujo de barrera:
+  1) Vehículo detectado en zona SALIENDO (↑) dentro del polígono → 1 pulso SUBIR
+  2) Un pulso SUBIR por cada vehículo (si pasan 4, sube 4)
+  3) No existe DETENER. Si no hay vehículos, no se envía nada y la barrera baja sola.
+
+Mejoras:
+  - Modo noche automático (CLAHE + conf baja)
+  - Tracking + dirección de movimiento (solo detecta salida ↑)
+  - Latencia reducida: YOLO 256px, webhook en hilo separado
+  - UI compacta: fullscreen, LEDs, panel colapsable
+
+Requisitos:
+  pip install opencv-python mss requests pillow numpy
+"""
+
+import threading
+import time
+import queue
+from datetime import datetime, timedelta
+from pathlib import Path
+import json
+import math
+
+import cv2
+import numpy as np
+import mss
+import requests
+import tkinter as tk
+
+try:
+    import winsound
+except Exception:
+    winsound = None
+
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    raise SystemExit("Falta Pillow: pip install pillow")
+
+# ── OpenCV ────────────────────────────────────────────────────────────────────
+cv2.setUseOptimized(True)
+cv2.setNumThreads(4)
+
+# ── PARÁMETROS ────────────────────────────────────────────────────────────────
+SCALE                   = 0.55
+YOLO_INPUT_SIZE         = 256
+CONF_THRES_DAY          = 0.35
+CONF_THRES_NIGHT        = 0.22
+NMS_THRES               = 0.40
+VEHICLE_CLASSES         = {"car", "bus", "truck", "motorbike", "bicycle"}
+NIGHT_BRIGHTNESS_THRESH = 60
+
+# Tracking
+MAX_TRACK_AGE           = 8
+MAX_MATCH_DIST          = 80
+MIN_FRAMES_CONFIRM      = 2
+MIN_MOVEMENT_UP         = 8
+
+# Temporización barrera
+BARRIER_RISE_WAIT       = 5.5   # seg tras SUBIR para dar tiempo a que suba
+
+# Limpieza de IDs disparados (para no crecer infinito)
+FIRED_TTL_SEC           = 12.0  # recordar track_id disparado por X seg
+
+# Confirmación visual opcional de barrera (si barrier_roi está configurada)
+BARRIER_CONFIRM_DELAY   = 2.8   # esperar un poco antes de mirar si la barrera cambió
+BARRIER_STUCK_DELAY     = 8.0   # si tras este tiempo sigue abajo y el vehículo sigue, alerta
+BARRIER_DIFF_THRESHOLD  = 10.0  # menor = más estricto. Ajustable según cámara
+BARRIER_CONFIRM_HITS    = 4     # chequeos consecutivos para evitar falsos positivos
+BARRIER_BASELINE_ALPHA  = 0.08  # actualización lenta del estado "barrera abajo"
+
+DEFAULT_MONITOR_INDEX   = 2
+
+# ── RUTAS ─────────────────────────────────────────────────────────────────────
+BASE_DIR     = Path(__file__).resolve().parent
+YOLO_CFG     = str(BASE_DIR / "yolov4-tiny.cfg")
+YOLO_WEIGHTS = str(BASE_DIR / "yolov4-tiny.weights")
+YOLO_NAMES   = str(BASE_DIR / "coco.names")
+STATE_FILE   = BASE_DIR / "webhook_state.json"
+CONFIG_FILE  = BASE_DIR / "roi_poly_config.json"
+
+# ── WEBHOOKS SUBIR ────────────────────────────────────────────────────────────
+RAW_OPEN_IDS = [
+    "7332b6c692284bddbc8b41154ea350ab",
+    "6290377639b949f3a5ac40303c463e0d",
+    "0f56cd5e899e4abcacd2d8adaf39b761",
+    "272c9e2f6ca74540bba26f3e93254309",
+    "838199dbb0af4de9a6221ee7eff8b970",
+    "70cad7d984684251b5afb4bb86587bad",
+    "99cf90d857c74b6d8746adb320936c73",
+    "b64adbb325a8424e9c7fedbc11a97382",
+    "bbaa9067ab064938aced336942829f84",
+    "b9b2124e43a34bbd9b2f4ed4672778c5",
+]
+
+open_ids = list(dict.fromkeys(RAW_OPEN_IDS))
+
+_open_state = {
+    "last_idx":  0,
+    "exhausted": {w: None for w in open_ids},
+    "calls":     {w: 0    for w in open_ids},
+}
+
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept":     "application/json,text/plain,*/*",
+    "Connection": "keep-alive",
+}
+
+# ── SESIÓN HTTP (reutiliza conexiones TCP) ───────────────────────────────────
+_http_session = requests.Session()
+_http_session.headers.update(HTTP_HEADERS)
+
+# ── PERSISTENCIA ROI + POLY ───────────────────────────────────────────────────
+def save_roi_poly(monitor_index, roi_xywh, poly, barrier_roi=None):
+    payload = {
+        "monitor_index": int(monitor_index),
+        "roi":  [int(v) for v in roi_xywh],
+        "poly": poly.astype(int).tolist(),
+    }
+    if barrier_roi is not None:
+        payload["barrier_roi"] = [int(v) for v in barrier_roi]
+    CONFIG_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def load_roi_poly():
+    if not CONFIG_FILE.exists():
+        return None
+    try:
+        d    = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        mon  = int(d["monitor_index"])
+        roi  = tuple(int(v) for v in d["roi"])
+        poly = np.array(d["poly"], dtype=np.int32)
+        broi = d.get("barrier_roi")
+        barrier_roi = tuple(int(v) for v in broi) if broi and len(broi) == 4 else None
+        if len(roi) != 4 or poly.shape[0] < 3:
+            return None
+        return mon, roi, poly, barrier_roi
+    except Exception:
+        return None
+
+# ── SELECCIÓN POLÍGONO ────────────────────────────────────────────────────────
+class PolySelector:
+    def __init__(self, title):
+        self.title  = title
+        self.points = []
+        self.cancel = False
+
+    def mouse_cb(self, event, x, y, flags, param):
+        if self.cancel:
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.points.append((x, y))
+        elif event == cv2.EVENT_RBUTTONDOWN and self.points:
+            self.points.pop()
+
+    def select(self, image):
+        cv2.namedWindow(self.title, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(self.title, self.mouse_cb)
+        while True:
+            vis = image.copy()
+            for p in self.points:
+                cv2.circle(vis, p, 4, (0, 255, 255), -1)
+            if len(self.points) >= 2:
+                cv2.polylines(vis, [np.array(self.points, np.int32)],
+                              False, (0, 255, 255), 2)
+            cv2.putText(vis,
+                "Izq:add  Der:undo  ENTER:ok  C:limpiar  ESC:cancelar",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (50, 255, 50),
+                2, cv2.LINE_AA)
+            cv2.imshow(self.title, vis)
+            k = cv2.waitKey(20) & 0xFF
+            if k == 27:
+                self.cancel = True
+                break
+            elif k in (10, 13) and len(self.points) >= 3:
+                break
+            elif k == ord('c'):
+                self.points = []
+        cv2.destroyWindow(self.title)
+        return None if self.cancel else np.array(self.points, np.int32)
+
+def point_in_poly(pt, poly):
+    return cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), False) >= 0
+
+def play_alert_beep():
+    if winsound is None:
+        return
+    try:
+        for _ in range(3):
+            winsound.Beep(1850, 180)
+            time.sleep(0.06)
+    except Exception:
+        pass
+
+# ── TRACKER ───────────────────────────────────────────────────────────────────
+class Track:
+    _nid = 0
+
+    def __init__(self, cx, cy):
+        self.id        = Track._nid
+        Track._nid    += 1
+        self.cx        = cx
+        self.cy        = cy
+        self.age       = 0
+        self.frames    = 1
+        self.dy_acc    = 0.0
+        self.confirmed = False
+
+    def update(self, cx, cy):
+        self.dy_acc   += cy - self.cy
+        self.cx, self.cy = cx, cy
+        self.age       = 0
+        self.frames   += 1
+        if self.frames >= MIN_FRAMES_CONFIRM:
+            self.confirmed = True
+
+    @property
+    def moving_up(self):
+        return self.dy_acc < -MIN_MOVEMENT_UP
+
+
+class CentroidTracker:
+    def __init__(self):
+        self.tracks = []
+
+    def update(self, dets):
+        for t in self.tracks:
+            t.age += 1
+        unmatched = list(range(len(dets)))
+        if self.tracks and dets:
+            used = set()
+            for di in list(unmatched):
+                cx, cy  = dets[di]
+                bt, bd  = None, MAX_MATCH_DIST
+                for ti, t in enumerate(self.tracks):
+                    if ti in used:
+                        continue
+                    d = math.hypot(cx - t.cx, cy - t.cy)
+                    if d < bd:
+                        bd = d
+                        bt = ti
+                if bt is not None:
+                    self.tracks[bt].update(*dets[di])
+                    used.add(bt)
+                    unmatched.remove(di)
+        for di in unmatched:
+            self.tracks.append(Track(*dets[di]))
+        self.tracks = [t for t in self.tracks if t.age <= MAX_TRACK_AGE]
+        return self.tracks
+
+# ── PERSISTENCIA ESTADO WEBHOOKS ──────────────────────────────────────────────
+def _load_state():
+    try:
+        if not STATE_FILE.exists():
+            return
+        d    = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        now  = datetime.now()
+        si   = d.get("open", {})
+        _open_state["last_idx"] = int(si.get("last_idx", 0)) % max(1, len(open_ids))
+        for wid in open_ids:
+            v = si.get("exhausted", {}).get(wid)
+            exp = datetime.fromisoformat(v) if v else None
+            _open_state["exhausted"][wid] = exp if (exp and exp > now) else None
+            c = si.get("calls", {}).get(wid)
+            if c is not None:
+                _open_state["calls"][wid] = int(c)
+    except Exception:
+        pass
+
+def _save_state():
+    try:
+        def _ser(state):
+            return {
+                "last_idx":  state["last_idx"],
+                "exhausted": {w: (v.isoformat() if v else None)
+                              for w, v in state["exhausted"].items()},
+                "calls":     state["calls"],
+            }
+        STATE_FILE.write_text(
+            json.dumps({"open": _ser(_open_state)}, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+_load_state()
+
+# ── COLA Y WORKER DE WEBHOOKS ────────────────────────────────────────────────
+_wh_queue        = queue.Queue(maxsize=50)
+_WH_MAX_RETRIES  = 3
+_WH_RETRY_DELAY  = 0.5   # seg entre reintentos
+_wh_results      = {}     # track_id -> {"status": "pending"|"ok"|"fail", "retries": int}
+_wh_results_lock = threading.Lock()
+
+
+def _wh_worker(engine_ref):
+    """Worker persistente: procesa webhooks de la cola con reintentos."""
+    while True:
+        try:
+            item = _wh_queue.get(timeout=2.0)
+        except queue.Empty:
+            continue
+
+        if item is None:          # Poison pill → salir
+            break
+
+        track_id, tag, retries = item
+        ok, reason, ms = pulso_subir()
+
+        with _wh_results_lock:
+            if ok:
+                _wh_results[track_id] = {"status": "ok", "retries": retries}
+                if engine_ref:
+                    engine_ref.set_wh(f"{tag} OK:{reason} ({ms}ms)")
+            else:
+                if retries < _WH_MAX_RETRIES:
+                    _wh_results[track_id] = {"status": "pending", "retries": retries + 1}
+                    time.sleep(_WH_RETRY_DELAY)
+                    try:
+                        _wh_queue.put_nowait((track_id, tag, retries + 1))
+                    except queue.Full:
+                        _wh_results[track_id] = {"status": "fail", "retries": retries + 1}
+                        if engine_ref:
+                            engine_ref.set_wh(f"{tag} FAIL(cola llena):{reason}")
+                        threading.Thread(target=play_alert_beep, daemon=True).start()
+                else:
+                    _wh_results[track_id] = {"status": "fail", "retries": retries}
+                    if engine_ref:
+                        engine_ref.set_wh(f"{tag} FAIL:{reason} ({retries}x)")
+                    threading.Thread(target=play_alert_beep, daemon=True).start()
+
+        _wh_queue.task_done()
+
+
+# ── WEBHOOK ENGINE ────────────────────────────────────────────────────────────
+def _fire(state, ids_list):
+    """Dispara un webhook del pool. Rota si 406 o error red. Devuelve (ok, reason, ms)."""
+    now = datetime.now()
+
+    # Limpiar agotados expirados
+    for wid in ids_list:
+        u = state["exhausted"].get(wid)
+        if u and now >= u:
+            state["exhausted"][wid] = None
+
+    n = len(ids_list)
+    if n == 0:
+        return False, "no_webhooks", 0
+
+    last_reason = "all_exhausted"
+    for step in range(n):
+        i   = (state["last_idx"] + step) % n
+        wid = ids_list[i]
+
+        u = state["exhausted"].get(wid)
+        if u and now < u:
+            last_reason = "exhausted"
+            continue
+
+        url = f"https://us-apia.coolkit.cc/v2/smartscene2/webhooks/execute?id={wid}"
+        try:
+            t0 = time.time()
+            r  = _http_session.get(url, timeout=3, allow_redirects=True)
+            ms = int((time.time() - t0) * 1000)
+
+            if not (200 <= r.status_code < 300):
+                last_reason = f"http_{r.status_code}"
+                continue
+
+            try:
+                d   = r.json()
+                err = d.get("error")
+                if err == 0:
+                    state["calls"][wid] = state["calls"].get(wid, 0) + 1
+                    state["last_idx"]   = (i + 1) % n
+                    _save_state()
+                    return True, "ok", ms
+                if err == 406:
+                    tom = (now + timedelta(days=1)).replace(hour=0, minute=3, second=0, microsecond=0)
+                    state["exhausted"][wid] = tom
+                    _save_state()
+                    last_reason = "err_406"
+                    continue
+                last_reason = f"err_{err}"
+                continue
+            except Exception:
+                state["calls"][wid] = state["calls"].get(wid, 0) + 1
+                state["last_idx"]   = (i + 1) % n
+                _save_state()
+                return True, f"ok_{r.status_code}", ms
+
+        except Exception as e:
+            last_reason = f"exc_{type(e).__name__}"
+            continue
+
+    return False, last_reason, 0
+
+def pulso_subir():
+    return _fire(_open_state, open_ids)
+
+# ── YOLO ──────────────────────────────────────────────────────────────────────
+with open(YOLO_NAMES, encoding="utf-8") as _f:
+    class_names = [l.strip() for l in _f]
+
+net        = cv2.dnn.readNetFromDarknet(YOLO_CFG, YOLO_WEIGHTS)
+net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+_lnames    = net.getLayerNames()
+out_layers = [_lnames[i - 1] for i in net.getUnconnectedOutLayers().flatten()]
+
+# ── MOTOR DE DETECCIÓN ────────────────────────────────────────────────────────
+class DetectionEngine:
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.thread     = None
+        self._lock      = threading.Lock()
+        self.last_frame = None
+        # estado publicado
+        self._status  = "LISTO"
+        self._wh_txt  = "N/A"
+        self._night   = False
+        self._veh_in  = 0
+        self._barrier = False
+        self._phase   = "LIBRE"
+        # ROI/POLY
+        self.monitor_index = 2
+        self.roi_xywh      = None
+        self.poly          = None
+        self.grab_rect     = None
+        self.barrier_roi   = None
+        self._poly_sc      = None
+        self._sc_cache     = None
+
+    # ── API thread-safe ──────────────────────────────────────────────────────
+    def set_status(self, t):
+        with self._lock:
+            self._status = t
+
+    def set_wh(self, t):
+        with self._lock:
+            self._wh_txt = t
+
+    def get_state(self):
+        with self._lock:
+            return (self._status, self._wh_txt, self._night,
+                    self._veh_in, self._barrier, self._phase)
+
+    def get_frame(self):
+        with self._lock:
+            return None if self.last_frame is None else self.last_frame.copy()
+
+    def _poly_at(self, scale):
+        if self._sc_cache != scale:
+            self._poly_sc  = (self.poly.astype(np.float32) * scale).astype(np.int32)
+            self._sc_cache = scale
+        return self._poly_sc
+
+    # ── selección ROI/POLY ───────────────────────────────────────────────────
+    def _select_roi(self, sct, monitor):
+        img = cv2.cvtColor(np.array(sct.grab(monitor)), cv2.COLOR_BGRA2BGR)
+        roi = cv2.selectROI("Selecciona ROI de salida", img, False)
+        cv2.destroyWindow("Selecciona ROI de salida")
+        return tuple(map(int, roi))
+
+    def _select_poly(self, sct, rect):
+        img  = cv2.cvtColor(np.array(sct.grab(rect)), cv2.COLOR_BGRA2BGR)
+        poly = PolySelector("Dibuja zona SALIDA (vehiculos suben ↑)").select(img)
+        if poly is None:
+            raise RuntimeError("Selección cancelada")
+        return poly
+
+
+    def _scale_rect(self, rect, scale):
+        if rect is None:
+            return None
+        x, y, w, h = rect
+        return (max(0, int(round(x * scale))),
+                max(0, int(round(y * scale))),
+                max(1, int(round(w * scale))),
+                max(1, int(round(h * scale))))
+
+    def _select_barrier_roi(self, sct, rect):
+        img = cv2.cvtColor(np.array(sct.grab(rect)), cv2.COLOR_BGRA2BGR)
+        roi = cv2.selectROI("Selecciona ROI BARRERA (opcional)", img, False)
+        cv2.destroyWindow("Selecciona ROI BARRERA (opcional)")
+        roi = tuple(map(int, roi))
+        if len(roi) != 4 or roi[2] == 0 or roi[3] == 0:
+            return None
+        return roi
+
+    def _barrier_patch(self, frame):
+        rect = self._scale_rect(self.barrier_roi, SCALE)
+        if rect is None:
+            return None
+        x, y, w, h = rect
+        H, W = frame.shape[:2]
+        x2, y2 = min(W, x + w), min(H, y + h)
+        if x >= x2 or y >= y2:
+            return None
+        patch = frame[y:y2, x:x2]
+        if patch.size == 0:
+            return None
+        patch = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        patch = cv2.GaussianBlur(patch, (5, 5), 0)
+        patch = cv2.resize(patch, (64, 32), interpolation=cv2.INTER_AREA)
+        return patch
+
+    def ensure_roi_poly(self):
+        loaded = load_roi_poly()
+        sct    = mss.mss()
+        if loaded is None:
+            self.monitor_index = (DEFAULT_MONITOR_INDEX
+                                  if DEFAULT_MONITOR_INDEX < len(sct.monitors)
+                                  else 1)
+            mon = sct.monitors[self.monitor_index]
+            self.set_status("Selecciona ROI… (si no aparece ventana, revisa que no esté detrás)")
+            rx, ry, rw, rh = self._select_roi(sct, mon)
+            if rw == 0 or rh == 0:
+                raise RuntimeError("ROI inválido")
+            rect = {"top": ry + mon["top"], "left": rx + mon["left"],
+                    "width": rw, "height": rh}
+            poly = self._select_poly(sct, rect)
+            # No forzar selección de barrera al activar: si no existe, el sistema arranca normal.
+            barrier_roi = None
+            save_roi_poly(self.monitor_index, (rx, ry, rw, rh), poly, barrier_roi)
+            self.roi_xywh    = (rx, ry, rw, rh)
+            self.poly        = poly
+            self.barrier_roi = barrier_roi
+            self.grab_rect   = rect
+        else:
+            self.monitor_index, roi, poly, barrier_roi = loaded
+            if self.monitor_index >= len(sct.monitors):
+                self.monitor_index = 1
+            mon = sct.monitors[self.monitor_index]
+            rx, ry, rw, rh = roi
+            self.roi_xywh    = roi
+            self.poly        = poly
+            self.barrier_roi = barrier_roi
+            self.grab_rect   = {"top": ry + mon["top"], "left": rx + mon["left"],
+                              "width": rw, "height": rh}
+        self.set_status("Config cargada ✓")
+
+    # ── start / stop ─────────────────────────────────────────────────────────
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.set_status("ACTIVANDO…")
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        try:
+            _wh_queue.put_nowait(None)   # Poison pill → detener worker
+        except queue.Full:
+            pass
+        self.set_status("DESACTIVADO")
+
+    # ── YOLO detect helper ────────────────────────────────────────────────────
+    def _yolo_detect_centroids(self, frame, conf_thres):
+        """
+        Retorna lista de centroides (cx, cy) de vehículos detectados.
+        frame: BGR ya escalado a tamaño de trabajo (SCALE aplicado).
+        """
+        (H, W) = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1/255.0, (YOLO_INPUT_SIZE, YOLO_INPUT_SIZE),
+                                     swapRB=True, crop=False)
+        net.setInput(blob)
+        outs = net.forward(out_layers)
+
+        boxes = []
+        confs = []
+        for out in outs:
+            for det in out:
+                scores = det[5:]
+                cls_id = int(np.argmax(scores))
+                conf   = float(scores[cls_id])
+                if conf < conf_thres:
+                    continue
+                label = class_names[cls_id] if 0 <= cls_id < len(class_names) else ""
+                if label not in VEHICLE_CLASSES:
+                    continue
+
+                cx = float(det[0]) * W
+                cy = float(det[1]) * H
+                w  = float(det[2]) * W
+                h  = float(det[3]) * H
+                x  = int(cx - w/2)
+                y  = int(cy - h/2)
+                boxes.append([x, y, int(w), int(h)])
+                confs.append(conf)
+
+        idxs = cv2.dnn.NMSBoxes(boxes, confs, conf_thres, NMS_THRES)
+        cents = []
+        if len(idxs) > 0:
+            for i in idxs.flatten():
+                x, y, w, h = boxes[i]
+                cx = x + w//2
+                cy = y + h//2
+                cents.append((int(cx), int(cy)))
+        return cents
+
+    # ── loop principal ────────────────────────────────────────────────────────
+    def _run(self):
+        try:
+            self.ensure_roi_poly()
+        except Exception as e:
+            self.set_status(f"Error: {e}")
+            return
+
+        sct     = mss.mss()
+        tracker = CentroidTracker()
+        clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
+        # ── lógica SUBIR por vehículo (sin DETENER) ───────────────────────────
+        phase        = "LIBRE"   # UI: LIBRE / SUBIENDO
+        last_open_t  = 0.0
+        fired_ids    = {}        # track_id -> timestamp último disparo
+        fps_s        = 0.0
+        prev_t       = time.time()
+        baseline_bar = None
+        confirm_hits = {}       # track_id -> chequeos consecutivos de "barrera sigue abajo"
+        alert_once    = set()
+        open_attempts = {}      # track_id -> timestamp del intento de apertura
+
+        # Worker persistente para webhooks (reemplaza thread-per-request)
+        wh_worker_thread = threading.Thread(target=_wh_worker, args=(self,), daemon=True)
+        wh_worker_thread.start()
+
+        self.set_status("ACTIVO")
+
+        while not self.stop_event.is_set():
+            try:
+                now = time.time()
+
+                # Grab ROI
+                img = np.array(sct.grab(self.grab_rect))  # BGRA
+                frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+                # Scale para velocidad
+                if SCALE != 1.0:
+                    frame = cv2.resize(frame, (0, 0), fx=SCALE, fy=SCALE,
+                                       interpolation=cv2.INTER_AREA)
+
+                # Modo noche automático (brightness promedio)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                mean_b = float(np.mean(gray))
+                night = mean_b < NIGHT_BRIGHTNESS_THRESH
+
+                if night:
+                    # CLAHE para levantar contraste (en gris)
+                    eq = clahe.apply(gray)
+                    frame = cv2.cvtColor(eq, cv2.COLOR_GRAY2BGR)
+
+                conf_th = CONF_THRES_NIGHT if night else CONF_THRES_DAY
+
+                # YOLO
+                t0 = time.time()
+                cents = self._yolo_detect_centroids(frame, conf_th)
+                inf_ms = int((time.time() - t0) * 1000)
+
+                # Filtrar centroides dentro del polígono
+                poly_sc = self._poly_at(SCALE)
+                cents_in = [c for c in cents if point_in_poly(c, poly_sc)]
+                tracks = tracker.update(cents_in)
+
+                # Conteo veh en zona
+                veh_in_zone = 0
+                valid_exit_tracks = []
+                for t in tracks:
+                    if t.confirmed and point_in_poly((t.cx, t.cy), poly_sc):
+                        veh_in_zone += 1
+                        # SOLO SALIDA (↑)
+                        if t.moving_up:
+                            valid_exit_tracks.append(t)
+
+                # Limpiar fired_ids viejos
+                if fired_ids:
+                    dead = [tid for tid, ts in fired_ids.items() if (now - ts) > FIRED_TTL_SEC]
+                    for tid in dead:
+                        fired_ids.pop(tid, None)
+                        open_attempts.pop(tid, None)
+                        confirm_hits.pop(tid, None)
+                        alert_once.discard(tid)
+                        with _wh_results_lock:
+                            _wh_results.pop(tid, None)
+
+                # Disparar SUBIR 1 vez por track id (vehículo), con reintentos
+                for t in valid_exit_tracks:
+                    tid = t.id
+                    with _wh_results_lock:
+                        result = _wh_results.get(tid)
+
+                    if tid not in fired_ids:
+                        # Nunca disparado → encolar webhook
+                        fired_ids[tid] = now
+                        open_attempts[tid] = now
+                        confirm_hits.pop(tid, None)
+                        alert_once.discard(tid)
+                        last_open_t = now
+                        with _wh_results_lock:
+                            _wh_results[tid] = {"status": "pending", "retries": 0}
+                        try:
+                            _wh_queue.put_nowait((tid, "SUBIR", 0))
+                        except queue.Full:
+                            self.set_wh("SUBIR FAIL: cola llena")
+                            fired_ids.pop(tid, None)
+                    elif result and result["status"] == "fail":
+                        # Falló y agotó reintentos → re-encolar
+                        fired_ids[tid] = now
+                        open_attempts[tid] = now
+                        confirm_hits.pop(tid, None)
+                        alert_once.discard(tid)
+                        last_open_t = now
+                        with _wh_results_lock:
+                            _wh_results[tid] = {"status": "pending", "retries": 0}
+                        try:
+                            _wh_queue.put_nowait((tid, "SUBIR-RETRY", 0))
+                        except queue.Full:
+                            pass
+
+                # Confirmación visual opcional de barrera (si hay ROI configurada)
+                barrier_patch = self._barrier_patch(frame)
+                barrier_changed = False
+                barrier_vis_txt = "OFF"
+
+                if barrier_patch is not None:
+                    if baseline_bar is None:
+                        baseline_bar = barrier_patch.astype(np.float32)
+                    elif veh_in_zone == 0 and (now - last_open_t) > BARRIER_RISE_WAIT:
+                        baseline_bar = (1.0 - BARRIER_BASELINE_ALPHA) * baseline_bar + BARRIER_BASELINE_ALPHA * barrier_patch
+
+                    diff_val = float(np.mean(cv2.absdiff(barrier_patch, baseline_bar.astype(np.uint8))))
+                    barrier_changed = diff_val >= BARRIER_DIFF_THRESHOLD
+                    barrier_vis_txt = "ARRIBA" if barrier_changed else "ABAJO"
+
+                    tracks_in_zone = {t.id for t in tracks if t.confirmed and point_in_poly((t.cx, t.cy), poly_sc)}
+                    for tid, t0_try in list(open_attempts.items()):
+                        if tid in alert_once:
+                            continue
+                        if tid not in tracks_in_zone:
+                            confirm_hits.pop(tid, None)
+                            continue
+
+                        with _wh_results_lock:
+                            result = _wh_results.get(tid)
+
+                        if not result or result.get("status") != "ok":
+                            continue
+                        elapsed = now - t0_try
+                        if elapsed < BARRIER_CONFIRM_DELAY:
+                            continue
+
+                        if not barrier_changed:
+                            confirm_hits[tid] = confirm_hits.get(tid, 0) + 1
+                        else:
+                            confirm_hits[tid] = 0
+
+                        if elapsed >= BARRIER_STUCK_DELAY and confirm_hits.get(tid, 0) >= BARRIER_CONFIRM_HITS:
+                            alert_once.add(tid)
+                            self.set_wh(f"ALERTA: barrera no sube (track {tid})")
+                            threading.Thread(target=play_alert_beep, daemon=True).start()
+
+                # Estado barrera (solo visual): se asume "abierta/subiendo" por X seg tras último SUBIR
+                barrier_open = (now - last_open_t) <= BARRIER_RISE_WAIT
+                phase = "SUBIENDO" if barrier_open else "LIBRE"
+
+                # HUD
+                cv2.polylines(frame, [poly_sc], True, (0, 255, 255), 2)
+                if self.barrier_roi is not None:
+                    bx, by, bw, bh = self._scale_rect(self.barrier_roi, SCALE)
+                    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (255, 200, 0), 2)
+                dt = now - prev_t
+                prev_t = now
+                fps_s = fps_s * 0.85 + (1.0 / max(1e-6, dt)) * 0.15
+
+                mode_t = "NOCHE" if night else "DIA"
+                pc = (0, 200, 255) if phase == "SUBIENDO" else (80, 80, 80)
+
+                cv2.putText(frame, f"FPS:{fps_s:.1f}  YOLO:{inf_ms}ms  {mode_t}",
+                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                            (50, 255, 50), 1, cv2.LINE_AA)
+                cv2.putText(frame, f"FASE: {phase}  Veh:{veh_in_zone}",
+                            (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                            pc, 2, cv2.LINE_AA)
+                cv2.putText(frame, f"BARRERA_VIS:{barrier_vis_txt}",
+                            (8, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (255, 220, 80) if barrier_vis_txt == "ARRIBA" else (180, 180, 180), 1, cv2.LINE_AA)
+
+                with self._lock:
+                    self._night   = night
+                    self._veh_in  = veh_in_zone
+                    self._barrier = barrier_open
+                    self._phase   = phase
+                    self.last_frame = frame
+
+            except Exception as e:
+                # MUY IMPORTANTE: evita que el hilo muera y el programa se “desactive solo”
+                self.set_wh(f"LOOP_ERR:{type(e).__name__}")
+                time.sleep(0.2)
+
+        self.set_status("DESACTIVADO")
+
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+COLORS = {
+    "bg":     "#0D1B2A",
+    "bg2":    "#1B2A3B",
+    "accent": "#1D6FD8",
+    "green":  "#22C55E",
+    "red":    "#EF4444",
+    "yellow": "#EAB308",
+    "orange": "#F97316",
+    "cyan":   "#06B6D4",
+    "text":   "#E2E8F0",
+    "sub":    "#94A3B8",
+}
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("SALIDA AUTOMATICA v2")
+        self.configure(bg=COLORS["bg"])
+        self.attributes("-fullscreen", True)
+        self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
+        self.bind("<F11>",    lambda e: self.attributes(
+            "-fullscreen", not self.attributes("-fullscreen")))
+
+        self.engine       = DetectionEngine()
+        self._tkimg       = None
+        self._panel_vis   = True
+
+        self._build_ui()
+        self.after(40, self._tick)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── construcción UI ──────────────────────────────────────────────────────
+    def _build_ui(self):
+        C = COLORS
+
+        # ── barra superior ────────────────────────────────────────────────────
+        top = tk.Frame(self, bg=C["bg2"], height=40)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+
+        tk.Label(top, text="● SALIDA AUTOMATICA v2",
+                 bg=C["bg2"], fg=C["accent"],
+                 font=("Segoe UI", 11, "bold")).pack(side="left", padx=10, pady=9)
+
+        self._btn_toggle = tk.Button(
+            top, text="▲ Panel", bg=C["bg2"], fg=C["sub"],
+            relief="flat", bd=0, font=("Segoe UI", 9),
+            command=self._toggle_panel)
+        self._btn_toggle.pack(side="right", padx=6)
+
+        tk.Label(top, text="ESC=ventana  F11=fullscreen",
+                 bg=C["bg2"], fg=C["sub"],
+                 font=("Segoe UI", 8)).pack(side="right", padx=8)
+
+        # ── panel control ─────────────────────────────────────────────────────
+        self._ctrl = tk.Frame(self, bg=C["bg"], pady=4)
+        self._ctrl.pack(fill="x")
+
+        # fila LEDs
+        row1 = tk.Frame(self._ctrl, bg=C["bg"])
+        row1.pack(fill="x", padx=10, pady=(2, 0))
+
+        def _led(parent, label):
+            tk.Label(parent, text=label, bg=C["bg"], fg=C["sub"],
+                     font=("Segoe UI", 8)).pack(side="left")
+            cv = tk.Canvas(parent, width=18, height=18,
+                           bg=C["bg"], highlightthickness=0)
+            cv.pack(side="left", padx=(3, 1))
+            oval = cv.create_oval(2, 2, 16, 16, fill=C["red"])
+            return cv, oval
+
+        self._led_sys_cv, self._led_sys_o = _led(row1, "SISTEMA:")
+        self._lbl_sys = tk.Label(row1, text="DESACTIVADO",
+                                 bg=C["bg"], fg=C["text"],
+                                 font=("Segoe UI", 9, "bold"))
+        self._lbl_sys.pack(side="left", padx=(2, 12))
+
+        self._led_bar_cv, self._led_bar_o = _led(row1, "BARRERA:")
+        self._lbl_bar = tk.Label(row1, text="LIBRE",
+                                 bg=C["bg"], fg=C["sub"],
+                                 font=("Segoe UI", 9, "bold"))
+        self._lbl_bar.pack(side="left", padx=(2, 12))
+
+        tk.Label(row1, text="FASE:", bg=C["bg"], fg=C["sub"],
+                 font=("Segoe UI", 8)).pack(side="left")
+        self._lbl_phase = tk.Label(row1, text="—",
+                                   bg=C["bg"], fg=C["sub"],
+                                   font=("Segoe UI", 9, "bold"))
+        self._lbl_phase.pack(side="left", padx=(3, 12))
+
+        tk.Label(row1, text="MODO:", bg=C["bg"], fg=C["sub"],
+                 font=("Segoe UI", 8)).pack(side="left")
+        self._lbl_mode = tk.Label(row1, text="DÍA ☀",
+                                  bg=C["bg"], fg=C["yellow"],
+                                  font=("Segoe UI", 9, "bold"))
+        self._lbl_mode.pack(side="left", padx=(3, 12))
+
+        tk.Label(row1, text="VEH:", bg=C["bg"], fg=C["sub"],
+                 font=("Segoe UI", 8)).pack(side="left")
+        self._lbl_veh = tk.Label(row1, text="0",
+                                 bg=C["bg"], fg=C["sub"],
+                                 font=("Segoe UI", 10, "bold"))
+        self._lbl_veh.pack(side="left", padx=(3, 12))
+
+        self._lbl_wh = tk.Label(row1, text="WH: N/A",
+                                bg=C["bg"], fg=C["sub"],
+                                font=("Segoe UI", 8))
+        self._lbl_wh.pack(side="left")
+
+        # fila botones
+        self._row2 = tk.Frame(self._ctrl, bg=C["bg"])
+        self._row2.pack(pady=(4, 4))
+
+        def _btn(text, bg, cmd, col, fg="white"):
+            b = tk.Button(self._row2, text=text, bg=bg, fg=fg,
+                          relief="flat", bd=0, padx=14, pady=5,
+                          font=("Segoe UI", 9, "bold"),
+                          activebackground=bg, command=cmd)
+            b.grid(row=0, column=col, padx=5)
+            return b
+
+        _btn("▶ ACTIVAR",       C["accent"], self._on_activate,   0)
+        _btn("■ DESACTIVAR",    "#374151",   self._on_deactivate, 1)
+        _btn("⚙ Reconfigurar",  "#1F2937",   self._on_reconfig,   2, C["sub"])
+
+        # ── área video ────────────────────────────────────────────────────────
+        self._vid_frame = tk.Frame(self, bg="#000")
+        self._vid_frame.pack(fill="both", expand=True)
+        self._vid_lbl = tk.Label(self._vid_frame, bg="#000")
+        self._vid_lbl.pack(fill="both", expand=True)
+
+    # ── callbacks ────────────────────────────────────────────────────────────
+    def _toggle_panel(self):
+        if self._panel_vis:
+            self._ctrl.pack_forget()
+            self._btn_toggle.configure(text="▼ Panel")
+        else:
+            self._ctrl.pack(fill="x", before=self._vid_frame)
+            self._btn_toggle.configure(text="▲ Panel")
+        self._panel_vis = not self._panel_vis
+
+    def _on_activate(self):
+        self._lbl_sys.configure(text="ACTIVANDO…", fg=COLORS["yellow"])
+        self.engine.start()
+
+    def _on_deactivate(self):
+        self.engine.stop()
+        self._vid_lbl.configure(image="")
+        self._tkimg = None
+        self._refresh("DESACTIVADO", "LIBRE", False, False, 0, "N/A")
+
+    def _on_reconfig(self):
+        self.engine.stop()
+        if CONFIG_FILE.exists():
+            CONFIG_FILE.unlink()
+        self._on_activate()
+
+    def _on_close(self):
+        try:
+            self.engine.stop()
+        except Exception:
+            pass
+        self.destroy()
+
+    # ── refresco LEDs ─────────────────────────────────────────────────────────
+    def _refresh(self, status, phase, night, barrier, veh_in, wh_txt):
+        C = COLORS
+
+        # LED sistema
+        if "ACTIVO" in status:
+            sc, st = C["green"], C["green"]
+        elif any(x in status for x in ("ACTIVANDO", "Config", "Selecciona")):
+            sc, st = C["yellow"], C["yellow"]
+        else:
+            sc, st = C["red"], C["text"]
+        self._led_sys_cv.itemconfig(self._led_sys_o, fill=sc)
+        self._lbl_sys.configure(text=status, fg=st)
+
+        # LED barrera + fase
+        phase_cfg = {
+            "LIBRE":    (C["sub"],  "LIBRE",    C["sub"]),
+            "SUBIENDO": (C["cyan"], "ABIERTA",  C["cyan"]),
+        }
+        bc, bt, btc = phase_cfg.get(phase, (C["sub"], "—", C["sub"]))
+        self._led_bar_cv.itemconfig(self._led_bar_o, fill=bc)
+        self._lbl_bar.configure(text=bt, fg=btc)
+        self._lbl_phase.configure(text=phase, fg=bc)
+
+        # modo
+        self._lbl_mode.configure(
+            text="NOCHE 🌙" if night else "DÍA ☀",
+            fg=C["sub"] if night else C["yellow"])
+
+        # vehículos
+        self._lbl_veh.configure(
+            text=str(veh_in),
+            fg=C["green"] if veh_in > 0 else C["sub"])
+
+        # webhook
+        self._lbl_wh.configure(text=f"WH: {wh_txt}")
+
+    # ── tick UI ───────────────────────────────────────────────────────────────
+    def _tick(self):
+        status, wh_txt, night, veh_in, barrier, phase = self.engine.get_state()
+        self._refresh(status, phase, night, barrier, veh_in, wh_txt)
+
+        frame = self.engine.get_frame()
+        if frame is not None and "ACTIVO" in status:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            vw  = self._vid_lbl.winfo_width()
+            vh  = self._vid_lbl.winfo_height()
+            if vw > 50 and vh > 50:
+                ih, iw = rgb.shape[:2]
+                s      = min(vw / iw, vh / ih)
+                rgb    = cv2.resize(rgb, (int(iw * s), int(ih * s)),
+                                    interpolation=cv2.INTER_AREA)
+            img = Image.fromarray(rgb)
+            self._tkimg = ImageTk.PhotoImage(img)
+            self._vid_lbl.configure(image=self._tkimg)
+        elif "DESACTIVADO" in status:
+            self._vid_lbl.configure(image="")
+            self._tkimg = None
+
+        self.after(40, self._tick)
+
+
+if __name__ == "__main__":
+    App().mainloop()
