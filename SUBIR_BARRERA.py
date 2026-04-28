@@ -46,9 +46,9 @@ cv2.setNumThreads(4)
 
 # ── PARÁMETROS ────────────────────────────────────────────────────────────────
 SCALE                   = 0.55
-YOLO_INPUT_SIZE         = 256
-CONF_THRES_DAY          = 0.35
-CONF_THRES_NIGHT        = 0.22
+YOLO_INPUT_SIZE         = 320
+CONF_THRES_DAY          = 0.30
+CONF_THRES_NIGHT        = 0.20
 NMS_THRES               = 0.40
 VEHICLE_CLASSES         = {"car", "bus", "truck", "motorbike", "bicycle"}
 NIGHT_BRIGHTNESS_THRESH = 60
@@ -58,6 +58,8 @@ MAX_TRACK_AGE           = 8
 MAX_MATCH_DIST          = 80
 MIN_FRAMES_CONFIRM      = 2
 MIN_MOVEMENT_UP         = 8
+TRACK_HISTORY_LEN       = 8
+MULTI_VEHICLE_REPEAT_SEC = 2.5
 
 # Temporización barrera
 BARRIER_RISE_WAIT       = 5.5   # seg tras SUBIR para dar tiempo a que suba
@@ -199,19 +201,31 @@ def play_alert_beep():
 class Track:
     _nid = 0
 
-    def __init__(self, cx, cy):
+    def __init__(self, det):
+        cx, cy         = det["centroid"]
         self.id        = Track._nid
         Track._nid    += 1
         self.cx        = cx
         self.cy        = cy
+        self.box       = det.get("box")
+        self.label     = det.get("label", "")
+        self.conf      = det.get("confidence", 0.0)
         self.age       = 0
         self.frames    = 1
         self.dy_acc    = 0.0
+        self.history   = [(cx, cy)]
         self.confirmed = False
 
-    def update(self, cx, cy):
+    def update(self, det):
+        cx, cy        = det["centroid"]
         self.dy_acc   += cy - self.cy
+        self.box       = det.get("box")
+        self.label     = det.get("label", self.label)
+        self.conf      = det.get("confidence", self.conf)
         self.cx, self.cy = cx, cy
+        self.history.append((cx, cy))
+        if len(self.history) > TRACK_HISTORY_LEN:
+            self.history.pop(0)
         self.age       = 0
         self.frames   += 1
         if self.frames >= MIN_FRAMES_CONFIRM:
@@ -219,7 +233,15 @@ class Track:
 
     @property
     def moving_up(self):
-        return self.dy_acc < -MIN_MOVEMENT_UP
+        if len(self.history) < MIN_FRAMES_CONFIRM:
+            return False
+        recent_dy = self.history[-1][1] - self.history[0][1]
+        up_steps = 0
+        for prev, cur in zip(self.history, self.history[1:]):
+            if cur[1] < prev[1] - 1:
+                up_steps += 1
+        needed_steps = max(1, (len(self.history) - 1) // 2)
+        return recent_dy < -MIN_MOVEMENT_UP and up_steps >= needed_steps
 
 
 class CentroidTracker:
@@ -233,7 +255,7 @@ class CentroidTracker:
         if self.tracks and dets:
             used = set()
             for di in list(unmatched):
-                cx, cy  = dets[di]
+                cx, cy  = dets[di]["centroid"]
                 bt, bd  = None, MAX_MATCH_DIST
                 for ti, t in enumerate(self.tracks):
                     if ti in used:
@@ -243,11 +265,11 @@ class CentroidTracker:
                         bd = d
                         bt = ti
                 if bt is not None:
-                    self.tracks[bt].update(*dets[di])
+                    self.tracks[bt].update(dets[di])
                     used.add(bt)
                     unmatched.remove(di)
         for di in unmatched:
-            self.tracks.append(Track(*dets[di]))
+            self.tracks.append(Track(dets[di]))
         self.tracks = [t for t in self.tracks if t.age <= MAX_TRACK_AGE]
         return self.tracks
 
@@ -292,8 +314,47 @@ _load_state()
 _wh_queue        = queue.Queue(maxsize=50)
 _WH_MAX_RETRIES  = 3
 _WH_RETRY_DELAY  = 0.5   # seg entre reintentos
-_wh_results      = {}     # track_id -> {"status": "pending"|"ok"|"fail", "retries": int}
+_wh_results      = {}     # event_id -> {"status": "pending"|"ok"|"fail", "retries": int}
 _wh_results_lock = threading.Lock()
+_wh_rate_lock    = threading.Lock()
+_wh_last_fire_ts = 0.0
+
+
+def _wait_for_webhook_slot():
+    global _wh_last_fire_ts
+    with _wh_rate_lock:
+        wait_s = MULTI_VEHICLE_REPEAT_SEC - (time.time() - _wh_last_fire_ts)
+        if wait_s > 0:
+            time.sleep(wait_s)
+        _wh_last_fire_ts = time.time()
+
+
+def _enqueue_webhook_event(event_id, tag, track_id=None, retries=0):
+    payload = {
+        "event_id": event_id,
+        "track_id": track_id,
+        "tag": tag,
+        "retries": retries,
+    }
+    with _wh_results_lock:
+        _wh_results[event_id] = {
+            "status": "pending",
+            "retries": retries,
+            "track_id": track_id,
+            "created_at": time.time(),
+        }
+    try:
+        _wh_queue.put_nowait(payload)
+        return True
+    except queue.Full:
+        with _wh_results_lock:
+            _wh_results[event_id] = {
+                "status": "fail",
+                "retries": retries,
+                "track_id": track_id,
+                "created_at": time.time(),
+            }
+        return False
 
 
 def _wh_worker(engine_ref):
@@ -307,30 +368,53 @@ def _wh_worker(engine_ref):
         if item is None:          # Poison pill → salir
             break
 
-        track_id, tag, retries = item
+        if isinstance(item, dict):
+            event_id = item["event_id"]
+            track_id = item.get("track_id")
+            tag = item["tag"]
+            retries = int(item.get("retries", 0))
+        else:
+            track_id, tag, retries = item
+            event_id = track_id
+
+        _wait_for_webhook_slot()
         ok, reason, ms = pulso_subir()
 
-        with _wh_results_lock:
-            if ok:
-                _wh_results[track_id] = {"status": "ok", "retries": retries}
+        if ok:
+            with _wh_results_lock:
+                _wh_results[event_id] = {
+                    "status": "ok",
+                    "retries": retries,
+                    "track_id": track_id,
+                    "created_at": time.time(),
+                }
+            if engine_ref:
+                engine_ref.set_wh(f"{tag} OK:{reason} ({ms}ms)")
+        elif retries < _WH_MAX_RETRIES:
+            with _wh_results_lock:
+                _wh_results[event_id] = {
+                    "status": "pending",
+                    "retries": retries + 1,
+                    "track_id": track_id,
+                    "created_at": time.time(),
+                }
+            time.sleep(_WH_RETRY_DELAY)
+            retry_ok = _enqueue_webhook_event(event_id, tag, track_id, retries + 1)
+            if not retry_ok:
                 if engine_ref:
-                    engine_ref.set_wh(f"{tag} OK:{reason} ({ms}ms)")
-            else:
-                if retries < _WH_MAX_RETRIES:
-                    _wh_results[track_id] = {"status": "pending", "retries": retries + 1}
-                    time.sleep(_WH_RETRY_DELAY)
-                    try:
-                        _wh_queue.put_nowait((track_id, tag, retries + 1))
-                    except queue.Full:
-                        _wh_results[track_id] = {"status": "fail", "retries": retries + 1}
-                        if engine_ref:
-                            engine_ref.set_wh(f"{tag} FAIL(cola llena):{reason}")
-                        threading.Thread(target=play_alert_beep, daemon=True).start()
-                else:
-                    _wh_results[track_id] = {"status": "fail", "retries": retries}
-                    if engine_ref:
-                        engine_ref.set_wh(f"{tag} FAIL:{reason} ({retries}x)")
-                    threading.Thread(target=play_alert_beep, daemon=True).start()
+                    engine_ref.set_wh(f"{tag} FAIL(cola llena):{reason}")
+                threading.Thread(target=play_alert_beep, daemon=True).start()
+        else:
+            with _wh_results_lock:
+                _wh_results[event_id] = {
+                    "status": "fail",
+                    "retries": retries,
+                    "track_id": track_id,
+                    "created_at": time.time(),
+                }
+            if engine_ref:
+                engine_ref.set_wh(f"{tag} FAIL:{reason} ({retries}x)")
+            threading.Thread(target=play_alert_beep, daemon=True).start()
 
         _wh_queue.task_done()
 
@@ -423,6 +507,7 @@ class DetectionEngine:
         self._wh_txt  = "N/A"
         self._night   = False
         self._veh_in  = 0
+        self._exit_in = 0
         self._barrier = False
         self._phase   = "LIBRE"
         # ROI/POLY
@@ -446,7 +531,7 @@ class DetectionEngine:
     def get_state(self):
         with self._lock:
             return (self._status, self._wh_txt, self._night,
-                    self._veh_in, self._barrier, self._phase)
+                    self._veh_in, self._exit_in, self._barrier, self._phase)
 
     def get_frame(self):
         with self._lock:
@@ -561,9 +646,9 @@ class DetectionEngine:
         self.set_status("DESACTIVADO")
 
     # ── YOLO detect helper ────────────────────────────────────────────────────
-    def _yolo_detect_centroids(self, frame, conf_thres):
+    def _yolo_detect_vehicles(self, frame, conf_thres):
         """
-        Retorna lista de centroides (cx, cy) de vehículos detectados.
+        Retorna detecciones de vehiculos con bbox, centro, confianza y clase.
         frame: BGR ya escalado a tamaño de trabajo (SCALE aplicado).
         """
         (H, W) = frame.shape[:2]
@@ -574,6 +659,7 @@ class DetectionEngine:
 
         boxes = []
         confs = []
+        labels = []
         for out in outs:
             for det in out:
                 scores = det[5:]
@@ -593,16 +679,22 @@ class DetectionEngine:
                 y  = int(cy - h/2)
                 boxes.append([x, y, int(w), int(h)])
                 confs.append(conf)
+                labels.append(label)
 
         idxs = cv2.dnn.NMSBoxes(boxes, confs, conf_thres, NMS_THRES)
-        cents = []
+        vehicles = []
         if len(idxs) > 0:
             for i in idxs.flatten():
                 x, y, w, h = boxes[i]
                 cx = x + w//2
                 cy = y + h//2
-                cents.append((int(cx), int(cy)))
-        return cents
+                vehicles.append({
+                    "box": (int(x), int(y), int(w), int(h)),
+                    "centroid": (int(cx), int(cy)),
+                    "confidence": float(confs[i]),
+                    "label": labels[i],
+                })
+        return vehicles
 
     # ── loop principal ────────────────────────────────────────────────────────
     def _run(self):
@@ -619,7 +711,9 @@ class DetectionEngine:
         # ── lógica SUBIR por vehículo (sin DETENER) ───────────────────────────
         phase        = "LIBRE"   # UI: LIBRE / SUBIENDO
         last_open_t  = 0.0
-        fired_ids    = {}        # track_id -> timestamp último disparo
+        fired_ids    = {}        # track_id -> timestamp primer disparo en vida del track
+        last_multi_open_t = 0.0
+        multi_event_seq   = 0
         fps_s        = 0.0
         prev_t       = time.time()
         baseline_bar = None
@@ -660,13 +754,13 @@ class DetectionEngine:
 
                 # YOLO
                 t0 = time.time()
-                cents = self._yolo_detect_centroids(frame, conf_th)
+                detections = self._yolo_detect_vehicles(frame, conf_th)
                 inf_ms = int((time.time() - t0) * 1000)
 
-                # Filtrar centroides dentro del polígono
+                # Filtrar detecciones dentro del polígono
                 poly_sc = self._poly_at(SCALE)
-                cents_in = [c for c in cents if point_in_poly(c, poly_sc)]
-                tracks = tracker.update(cents_in)
+                detections_in = [d for d in detections if point_in_poly(d["centroid"], poly_sc)]
+                tracks = tracker.update(detections_in)
 
                 # Conteo veh en zona
                 veh_in_zone = 0
@@ -677,10 +771,12 @@ class DetectionEngine:
                         # SOLO SALIDA (↑)
                         if t.moving_up:
                             valid_exit_tracks.append(t)
+                exit_in_zone = len(valid_exit_tracks)
 
-                # Limpiar fired_ids viejos
+                # Limpiar tracks que ya salieron de la vida del tracker.
                 if fired_ids:
-                    dead = [tid for tid, ts in fired_ids.items() if (now - ts) > FIRED_TTL_SEC]
+                    active_track_ids = {t.id for t in tracks}
+                    dead = [tid for tid in fired_ids if tid not in active_track_ids]
                     for tid in dead:
                         fired_ids.pop(tid, None)
                         open_attempts.pop(tid, None)
@@ -688,6 +784,15 @@ class DetectionEngine:
                         alert_once.discard(tid)
                         with _wh_results_lock:
                             _wh_results.pop(tid, None)
+                with _wh_results_lock:
+                    old_multi = [
+                        eid for eid, data in _wh_results.items()
+                        if isinstance(eid, str)
+                        and eid.startswith("multi-")
+                        and (now - data.get("created_at", now)) > FIRED_TTL_SEC
+                    ]
+                    for eid in old_multi:
+                        _wh_results.pop(eid, None)
 
                 # Disparar SUBIR 1 vez por track id (vehículo), con reintentos
                 for t in valid_exit_tracks:
@@ -702,11 +807,7 @@ class DetectionEngine:
                         confirm_hits.pop(tid, None)
                         alert_once.discard(tid)
                         last_open_t = now
-                        with _wh_results_lock:
-                            _wh_results[tid] = {"status": "pending", "retries": 0}
-                        try:
-                            _wh_queue.put_nowait((tid, "SUBIR", 0))
-                        except queue.Full:
+                        if not _enqueue_webhook_event(tid, "SUBIR", track_id=tid):
                             self.set_wh("SUBIR FAIL: cola llena")
                             fired_ids.pop(tid, None)
                     elif result and result["status"] == "fail":
@@ -716,12 +817,20 @@ class DetectionEngine:
                         confirm_hits.pop(tid, None)
                         alert_once.discard(tid)
                         last_open_t = now
-                        with _wh_results_lock:
-                            _wh_results[tid] = {"status": "pending", "retries": 0}
-                        try:
-                            _wh_queue.put_nowait((tid, "SUBIR-RETRY", 0))
-                        except queue.Full:
-                            pass
+                        if not _enqueue_webhook_event(tid, "SUBIR-RETRY", track_id=tid):
+                            self.set_wh("SUBIR-RETRY FAIL: cola llena")
+
+                multi_active = exit_in_zone >= 2
+                if multi_active and (now - last_multi_open_t) >= MULTI_VEHICLE_REPEAT_SEC:
+                    multi_event_seq += 1
+                    last_multi_open_t = now
+                    last_open_t = now
+                    event_id = f"multi-{multi_event_seq}"
+                    tag = f"SUBIR-MULTI x{exit_in_zone}"
+                    if _enqueue_webhook_event(event_id, tag):
+                        self.set_wh(f"{tag} en cola")
+                    else:
+                        self.set_wh(f"{tag} FAIL: cola llena")
 
                 # Confirmación visual opcional de barrera (si hay ROI configurada)
                 barrier_patch = self._barrier_patch(frame)
@@ -771,6 +880,14 @@ class DetectionEngine:
 
                 # HUD
                 cv2.polylines(frame, [poly_sc], True, (0, 255, 255), 2)
+                for t in tracks:
+                    if not t.confirmed or not point_in_poly((t.cx, t.cy), poly_sc):
+                        continue
+                    color = (60, 220, 60) if t.moving_up else (0, 180, 255)
+                    if t.box:
+                        x, y, w, h = t.box
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
+                    cv2.circle(frame, (int(t.cx), int(t.cy)), 3, color, -1)
                 if self.barrier_roi is not None:
                     bx, by, bw, bh = self._scale_rect(self.barrier_roi, SCALE)
                     cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (255, 200, 0), 2)
@@ -784,7 +901,10 @@ class DetectionEngine:
                 cv2.putText(frame, f"FPS:{fps_s:.1f}  YOLO:{inf_ms}ms  {mode_t}",
                             (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
                             (50, 255, 50), 1, cv2.LINE_AA)
-                cv2.putText(frame, f"FASE: {phase}  Veh:{veh_in_zone}",
+                status_line = f"FASE: {phase}  Veh:{veh_in_zone}  Salida:{exit_in_zone}"
+                if multi_active:
+                    status_line += f"  SUBIR-MULTI x{exit_in_zone}"
+                cv2.putText(frame, status_line,
                             (8, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
                             pc, 2, cv2.LINE_AA)
                 cv2.putText(frame, f"BARRERA_VIS:{barrier_vis_txt}",
@@ -794,6 +914,7 @@ class DetectionEngine:
                 with self._lock:
                     self._night   = night
                     self._veh_in  = veh_in_zone
+                    self._exit_in = exit_in_zone
                     self._barrier = barrier_open
                     self._phase   = phase
                     self.last_frame = frame
@@ -904,9 +1025,9 @@ class App(tk.Tk):
                                   font=("Segoe UI", 9, "bold"))
         self._lbl_mode.pack(side="left", padx=(3, 12))
 
-        tk.Label(row1, text="VEH:", bg=C["bg"], fg=C["sub"],
+        tk.Label(row1, text="VEH/SAL:", bg=C["bg"], fg=C["sub"],
                  font=("Segoe UI", 8)).pack(side="left")
-        self._lbl_veh = tk.Label(row1, text="0",
+        self._lbl_veh = tk.Label(row1, text="0 / 0",
                                  bg=C["bg"], fg=C["sub"],
                                  font=("Segoe UI", 10, "bold"))
         self._lbl_veh.pack(side="left", padx=(3, 12))
@@ -956,7 +1077,7 @@ class App(tk.Tk):
         self.engine.stop()
         self._vid_lbl.configure(image="")
         self._tkimg = None
-        self._refresh("DESACTIVADO", "LIBRE", False, False, 0, "N/A")
+        self._refresh("DESACTIVADO", "LIBRE", False, False, 0, 0, "N/A")
 
     def _on_reconfig(self):
         self.engine.stop()
@@ -972,7 +1093,7 @@ class App(tk.Tk):
         self.destroy()
 
     # ── refresco LEDs ─────────────────────────────────────────────────────────
-    def _refresh(self, status, phase, night, barrier, veh_in, wh_txt):
+    def _refresh(self, status, phase, night, barrier, veh_in, exit_in, wh_txt):
         C = COLORS
 
         # LED sistema
@@ -1002,16 +1123,16 @@ class App(tk.Tk):
 
         # vehículos
         self._lbl_veh.configure(
-            text=str(veh_in),
-            fg=C["green"] if veh_in > 0 else C["sub"])
+            text=f"{veh_in} / {exit_in}",
+            fg=C["green"] if exit_in > 0 else (C["yellow"] if veh_in > 0 else C["sub"]))
 
         # webhook
         self._lbl_wh.configure(text=f"WH: {wh_txt}")
 
     # ── tick UI ───────────────────────────────────────────────────────────────
     def _tick(self):
-        status, wh_txt, night, veh_in, barrier, phase = self.engine.get_state()
-        self._refresh(status, phase, night, barrier, veh_in, wh_txt)
+        status, wh_txt, night, veh_in, exit_in, barrier, phase = self.engine.get_state()
+        self._refresh(status, phase, night, barrier, veh_in, exit_in, wh_txt)
 
         frame = self.engine.get_frame()
         if frame is not None and "ACTIVO" in status:
